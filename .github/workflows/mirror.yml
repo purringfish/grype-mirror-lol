@@ -1,0 +1,32 @@
+name: mirror-grype-db
+# Раз в день качает свежую базу grype с anchore и обновляет оба зеркала
+# (GitHub-релиз + GitVerse-пакет). Запускается по расписанию и кнопкой вручную.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'      # каждый день в 04:00 UTC (07:00 МСК)
+  workflow_dispatch: {}       # кнопка "Run workflow" во вкладке Actions
+
+permissions:
+  contents: write             # нужно, чтобы github-grype-mirror.sh мог
+                              # создавать релиз и коммитить latest.json через GITHUB_TOKEN
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GitHub mirror
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}    # встроенный токен, отдельный PAT не нужен
+        run: |
+          chmod +x github-grype-mirror.sh
+          ./github-grype-mirror.sh
+
+      - name: GitVerse mirror
+        env:
+          GV_TOKEN: ${{ secrets.GV_TOKEN }}     # добавь в Settings → Secrets and variables → Actions
+        run: |
+          chmod +x gitverse-grype-mirror.sh
+          ./gitverse-grype-mirror.sh
