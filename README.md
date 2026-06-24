@@ -1,1 +1,0 @@
-# grype-mirror-lol
