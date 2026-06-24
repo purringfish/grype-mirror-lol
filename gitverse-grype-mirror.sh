@@ -86,8 +86,12 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 # --- 3. Прочитать текущий index.json (если есть) ------------------------------
-log "Читаю текущий index.json..."
-OLD_INDEX="$(wget -q -O - "$PKGBASE/index.json" 2>/dev/null || true)"
+log "Читаю текущий index.json (с авторизацией, в обход CDN-кэша)..."
+# ВАЖНО: читаем реестр ИМЕННО авторизованно. Анонимный GET GitVerse отдаёт через CDN
+# устаревшую копию (в CI с зарубежных IP — особенно), из-за чего ledger «терялся» и
+# старые части копились сиротами. Авторизованный запрос идёт в origin (Gitea) и всегда
+# свежий; ?nocache добивает любой промежуточный кэш.
+OLD_INDEX="$(curl -fsS "${AUTH[@]}" -H 'Cache-Control: no-cache' "$PKGBASE/index.json?nocache=$(date +%s%N)" 2>/dev/null || true)"
 
 # посчитать новый индекс (новая сборка впереди, дедуп по id, держим KEEP) и
 # СПИСОК ЧАСТЕЙ К УДАЛЕНИЮ -> evict.txt.
@@ -154,7 +158,8 @@ fi
 
 # --- 7. Самопроверка -----------------------------------------------------------
 log "Проверяю, что index.json отдаётся..."
-wget -q -O /tmp/_gv_chk "$PKGBASE/index.json" && log "OK: $(tr -d '\n' </tmp/_gv_chk | cut -c1-90)..."
+curl -fsS "${AUTH[@]}" -H 'Cache-Control: no-cache' "$PKGBASE/index.json?nocache=$(date +%s%N)" -o /tmp/_gv_chk \
+  && log "OK: $(tr -d '\n' </tmp/_gv_chk | cut -c1-90)..."
 
 log "Готово! Зеркало GitVerse обновлено."
 echo
