@@ -118,16 +118,18 @@ RESP="$(curl -sS "${HDR[@]}" -X PUT "$API/repos/$GH_OWNER/$GH_REPO/contents/$GPA
 python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if d.get("content") else 1)' <<<"$RESP" \
   || { echo "Ошибка коммита latest.json:" >&2; echo "$RESP" | head -c 400 >&2; exit 1; }
 
-# --- 6. Чистка: в релизе всегда не больше 2 архивов --------------------------
-# Все сборки одной схемы (v6.1.7) лежат ассетами в ОДНОМ релизе. Оставляем 2
-# самых свежих ассета, остальные удаляем, чтобы зеркало не разрасталось.
-log "Чищу старые архивы в релизе (оставляю только 2 последних)..."
+# --- 6. Чистка: в релизе всегда только актуальный архив ----------------------
+# Все сборки одной схемы (v6.1.7) лежат ассетами в ОДНОМ релизе. Оставляем 1
+# самый свежий ассет, остальные удаляем, чтобы зеркало не разрасталось.
+KEEP=1
+log "Чищу старые архивы в релизе (оставляю только $KEEP последний)..."
 (
   curl -s "${HDR[@]}" "$API/repos/$GH_OWNER/$GH_REPO/releases/$REL_ID/assets?per_page=100" \
-    | python3 -c "import json,sys
+    | KEEP="$KEEP" python3 -c "import json,sys,os
+k=int(os.environ['KEEP'])
 a=[x for x in json.load(sys.stdin) if isinstance(x,dict)]
 a.sort(key=lambda x:x.get('created_at',''),reverse=True)
-for x in a[2:]:
+for x in a[k:]:
     print(x['id'], x.get('name',''))" \
     | while read -r AID ANAME; do
         [[ -n "$AID" ]] || continue
