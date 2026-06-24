@@ -12,7 +12,8 @@
 #   …/api/packages/<owner>/generic/grype-db/v6/<архив>.tar.zst.part00
 #   …/api/packages/<owner>/generic/grype-db/v6/<архив>.tar.zst.part01
 #
-# На GitVerse всегда хранится не больше 2 сборок (части старых — удаляются).
+# На GitVerse хранится только актуальная сборка (KEEP=1); части прежних — удаляются,
+# включая осиротевшие куски от ручных запусков (через реестр all_parts в index.json).
 #
 set -euo pipefail
 
@@ -24,7 +25,7 @@ GV_TOKEN="${GV_TOKEN:?нужен GV_TOKEN — токен GitVerse (в CI secrets
 PKG="${GV_PKG:?нужен GV_PKG — пакет/репозиторий GitVerse (в CI secrets.GV_PKG)}"
 VERSEG=v6                                           # сегмент версии в реестре
 PART_SIZE=90m                                        # размер куска (< лимита 100 МБ)
-KEEP=2                                                # сколько сборок держать на GitVerse
+KEEP=1                                                # сколько сборок держать на GitVerse (1 = только актуальная)
 
 UPSTREAM="https://grype.anchore.io/databases/v6"   # официальный источник v6
 # -----------------------------------------------------------------------------
@@ -88,23 +89,34 @@ fi
 log "Читаю текущий index.json..."
 OLD_INDEX="$(wget -q -O - "$PKGBASE/index.json" 2>/dev/null || true)"
 
-# посчитать новый индекс (новая сборка впереди, дедуп по id, держим KEEP),
-# и СПИСОК ЧАСТЕЙ К УДАЛЕНИЮ (вытесненные сборки) -> в файл evict.txt
+# посчитать новый индекс (новая сборка впереди, дедуп по id, держим KEEP) и
+# СПИСОК ЧАСТЕЙ К УДАЛЕНИЮ -> evict.txt.
+# Чистка идёт по реестру all_parts: туда складываются ВСЕ когда-либо залитые части,
+# и на каждом прогоне удаляется всё, что не входит в оставляемые сборки. Так
+# вычищаются и «осиротевшие» куски от ручных/прерванных запусков (листинга файлов
+# у GitVerse нет, поэтому ориентируемся на собственный реестр).
 NEW_INDEX="$(python3 - "$KEEP" "$NEW_BUILD" "$WORKDIR/evict.txt" <<'PY'
 import json,sys
 keep=int(sys.argv[1]); new=json.loads(sys.argv[2]); evict_path=sys.argv[3]
 old=sys.stdin.read().strip()
-builds=[]
+data={}
 if old:
-    try: builds=json.loads(old).get("builds",[])
-    except Exception: builds=[]
-builds=[b for b in builds if b.get("id")!=new["id"]]
+    try: data=json.loads(old)
+    except Exception: data={}
+builds=[b for b in data.get("builds",[]) if b.get("id")!=new["id"]]
 allb=[new]+builds
-keepb=allb[:keep]; evict=allb[keep:]
+keepb=allb[:keep]
+keep_parts=set()
+for b in keepb:
+    keep_parts.update(b.get("parts",[]))
+# реестр всех известных частей: старый all_parts + части всех сборок из индекса + новые
+ledger=set(data.get("all_parts",[]))
+ledger.update(new.get("parts",[]))
+for b in builds: ledger.update(b.get("parts",[]))
+evict=sorted(ledger-keep_parts)          # всё лишнее на удаление
 with open(evict_path,"w") as f:
-    for b in evict:
-        for p in b.get("parts",[]): f.write(p+"\n")
-print(json.dumps({"builds":keepb},indent=2,ensure_ascii=False))
+    for p in evict: f.write(p+"\n")
+print(json.dumps({"builds":keepb,"all_parts":sorted(keep_parts)},indent=2,ensure_ascii=False))
 PY
 <<<"$OLD_INDEX")"
 printf '%s\n' "$NEW_INDEX" > "$WORKDIR/index.json"
