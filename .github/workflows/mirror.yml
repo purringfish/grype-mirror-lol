@@ -26,7 +26,9 @@ jobs:
 
       - name: GitVerse mirror
         env:
-          GV_TOKEN: ${{ secrets.GV_TOKEN }}     # добавь в Settings → Secrets and variables → Actions
+          GV_TOKEN: ${{ secrets.GV_TOKEN }}     # токен GitVerse
+          GV_OWNER: ${{ secrets.GV_OWNER }}     # ник GitVerse
+          GV_PKG:   ${{ secrets.GV_PKG }}       # пакет/репозиторий GitVerse
         run: |
           chmod +x gitverse-grype-mirror.sh
           ./gitverse-grype-mirror.sh
