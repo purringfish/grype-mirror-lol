@@ -1,37 +1,43 @@
 #!/usr/bin/env bash
 #
 # gitverse-grype-mirror.sh
-# Зеркалит grype v6 vulnerability-db в GitVerse через generic-реестр пакетов.
+# Зеркалит grype v6 vulnerability-db В САМ РЕПОЗИТОРИЙ GitVerse (через git push),
+# а не в generic-реестр пакетов.
 #
-# GitVerse держит лимит 100 МБ/файл, а архив базы ~123 МБ, поэтому архив РЕЖЕТСЯ
-# на части по ~90 МБ (split) и заливается кусками. Рядом кладётся index.json со
-# списком частей, контрольной суммой целого архива и историей сборок.
+# Почему git push, а не API: у GitVerse REST API репозитория доступен только на ЧТЕНИЕ
+# (contents PUT -> 401, releases/tags POST -> 404, даже полным токеном). Запись в репозиторий
+# возможна лишь обычным git-пушем по HTTPS — он работает и токеном авторизуется.
 #
-# Раскладка (owner=$GV_OWNER, пакет grype-db, версия v6):
-#   …/api/packages/<owner>/generic/grype-db/v6/index.json          <- манифест/история
-#   …/api/packages/<owner>/generic/grype-db/v6/<архив>.tar.zst.part00
-#   …/api/packages/<owner>/generic/grype-db/v6/<архив>.tar.zst.part01
+# GitVerse держит лимит ~100 МБ/файл, а архив базы ~123 МБ, поэтому архив РЕЖЕТСЯ на части
+# по ~90 МБ (split) и кладётся файлами в репозиторий. Рядом — index.json (имя архива, sha256,
+# список частей).
 #
-# На GitVerse хранится только актуальная сборка (KEEP=1); части прежних — удаляются,
-# включая осиротевшие куски от ручных запусков (через реестр all_parts в index.json).
+# Раскладка: отдельная ветка $GV_BRANCH (по умолчанию "db"), которую КАЖДЫЙ прогон
+# пересоздаёт как orphan (без истории) и пушит с -f. Так в репозитории всегда лежит ровно
+# одна (актуальная) сборка, а прежняя затирается — место не растёт. Файлы видны в репозитории
+# и отдаются анонимно по raw-URL:
+#   https://gitverse.ru/api/repos/<owner>/<repo>/raw/branch/<branch>/index.json
+#   https://gitverse.ru/api/repos/<owner>/<repo>/raw/branch/<branch>/<архив>.tar.zst.part00
 #
 set -euo pipefail
 
 # ----------------------------- НАСТРОЙКИ -------------------------------------
-# Ник, пакет/репозиторий и токен GitVerse в скрипте НЕ хранятся — только из окружения
-# (в GitHub Actions это secrets.GV_OWNER / secrets.GV_PKG / secrets.GV_TOKEN).
+# Ник, репозиторий и токен GitVerse в скрипте НЕ хранятся — только из окружения
+# (в GitHub Actions это secrets.GV_OWNER / secrets.GV_REPO / secrets.GV_TOKEN).
 GV_OWNER="${GV_OWNER:?нужен GV_OWNER — ник GitVerse (в CI secrets.GV_OWNER)}"
 GV_TOKEN="${GV_TOKEN:?нужен GV_TOKEN — токен GitVerse (в CI secrets.GV_TOKEN)}"
-PKG="${GV_PKG:?нужен GV_PKG — пакет/репозиторий GitVerse (в CI secrets.GV_PKG)}"
-VERSEG=v6                                           # сегмент версии в реестре
-PART_SIZE=90m                                        # размер куска (< лимита 100 МБ)
-KEEP=1                                                # сколько сборок держать на GitVerse (1 = только актуальная)
+GV_REPO="${GV_REPO:?нужен GV_REPO — репозиторий GitVerse (в CI secrets.GV_REPO)}"
+GV_BRANCH="${GV_BRANCH:-db}"                          # ветка-хранилище базы (orphan, force-push)
+PART_SIZE=80m                                         # размер куска; ВАЖНО: GitVerse режет и размер
+                                                     # одного git-push (~100 МБ, HTTP 413), поэтому
+                                                     # ниже каждая часть пушится отдельным коммитом
 
-UPSTREAM="https://grype.anchore.io/databases/v6"   # официальный источник v6
+UPSTREAM="https://grype.anchore.io/databases/v6"     # официальный источник v6
+GV_HOST="gitverse.ru"
 # -----------------------------------------------------------------------------
 
-PKGBASE="https://gitverse.ru/api/packages/$GV_OWNER/generic/$PKG/$VERSEG"
-AUTH=(-u "$GV_OWNER:$GV_TOKEN")
+export GV_OWNER GV_TOKEN                              # нужны askpass-скрипту
+RAWBASE="https://$GV_HOST/api/repos/$GV_OWNER/$GV_REPO/raw/branch/$GV_BRANCH"
 WORKDIR="$(mktemp -d)"; trap 'rm -rf "$WORKDIR"' EXIT
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -64,107 +70,91 @@ GOT="$(sha256sum "$WORKDIR/$SAFE_NAME" | awk '{print $1}')"
 log "sha256 ОК | размер: $(du -h "$WORKDIR/$SAFE_NAME" | awk '{print $1}')"
 
 # --- 2. Нарезать на части по PART_SIZE ----------------------------------------
+PAYLOAD="$WORKDIR/payload"; mkdir -p "$PAYLOAD"
 log "Режу архив на части по $PART_SIZE..."
-( cd "$WORKDIR" && split -b "$PART_SIZE" -d -a 2 "$SAFE_NAME" "$SAFE_NAME.part" )
+( cd "$PAYLOAD" && split -b "$PART_SIZE" -d -a 2 "$WORKDIR/$SAFE_NAME" "$SAFE_NAME.part" )
 PARTS=()
 while IFS= read -r p; do PARTS+=("$(basename "$p")"); done \
-  < <(find "$WORKDIR" -maxdepth 1 -name "$SAFE_NAME.part*" | sort)
+  < <(find "$PAYLOAD" -maxdepth 1 -name "$SAFE_NAME.part*" | sort)
 log "Частей: ${#PARTS[@]} -> ${PARTS[*]}"
 
-# собрать запись о текущей сборке (JSON одной строкой)
-NEW_BUILD="$(python3 - "$BUILD_ID" "$SAFE_NAME" "sha256:$WANT" "$SCHEMA" "$BUILT" "${PARTS[@]}" <<'PY'
+# index.json (формат, который понимает клиент grype-db-pull.sh: builds[0])
+python3 - "$PAYLOAD/index.json" "$BUILD_ID" "$SAFE_NAME" "sha256:$WANT" "$SCHEMA" "$BUILT" "${PARTS[@]}" <<'PY'
 import json,sys
-bid,name,checksum,schema,built,*parts=sys.argv[1:]
-print(json.dumps({"id":bid,"name":name,"checksum":checksum,"schema":schema,"built":built,"parts":parts}))
+out,bid,name,checksum,schema,built,*parts=sys.argv[1:]
+json.dump({"builds":[{"id":bid,"name":name,"checksum":checksum,
+                      "schema":schema,"built":built,"parts":parts}]},
+          open(out,"w"),indent=2,ensure_ascii=False)
 PY
-)"
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  log "DRY_RUN=1 — в GitVerse ничего не заливаю. Запись о сборке:"
-  echo "$NEW_BUILD"
+  log "DRY_RUN=1 — в GitVerse ничего не пушу. index.json:"
+  cat "$PAYLOAD/index.json"; echo
   exit 0
 fi
 
-# --- 3. Прочитать текущий index.json (если есть) ------------------------------
-log "Читаю текущий index.json (авторизованно, origin)..."
-# Читаем реестр авторизованно (origin Gitea), а не анонимно: анонимный GET у GitVerse
-# идёт через CDN и легче отдаёт устаревшую копию. Но между регионами всё равно есть лаг
-# репликации (у CI-раннеров — зарубежный IP), поэтому чистка рассчитана на СУТОЧНЫЙ цикл:
-# к следующему прогону индекс прошлой сборки уже виден, и её части вытесняются штатно.
-# Заливки «в обход» этого цикла (ручные запуски) надёжно не отслеживаются — у GitVerse нет
-# API листинга файлов, такие сироты убираются только вручную.
-OLD_INDEX="$(curl -fsS "${AUTH[@]}" -H 'Cache-Control: no-cache' "$PKGBASE/index.json?nocache=$(date +%s%N)" 2>/dev/null || true)"
+# --- 3. Залить в репозиторий: orphan-ветка $GV_BRANCH + force-push -------------
+# askpass: отдаёт git'у логин/токен из окружения, чтобы токен не светился в URL/командах
+ASKPASS="$WORKDIR/askpass.sh"
+cat > "$ASKPASS" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  *[Uu]sername*) printf '%s' "$GV_OWNER" ;;
+  *[Pp]assword*) printf '%s' "$GV_TOKEN" ;;
+esac
+EOF
+chmod 700 "$ASKPASS"
+export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
 
-# посчитать новый индекс (новая сборка впереди, дедуп по id, держим KEEP) и
-# СПИСОК ЧАСТЕЙ К УДАЛЕНИЮ -> evict.txt.
-# Чистка идёт по реестру all_parts: туда складываются ВСЕ когда-либо залитые части,
-# и на каждом прогоне удаляется всё, что не входит в оставляемые сборки. Так
-# вычищаются и «осиротевшие» куски от ручных/прерванных запусков (листинга файлов
-# у GitVerse нет, поэтому ориентируемся на собственный реестр).
-NEW_INDEX="$(python3 - "$KEEP" "$NEW_BUILD" "$WORKDIR/evict.txt" <<'PY'
-import json,sys
-keep=int(sys.argv[1]); new=json.loads(sys.argv[2]); evict_path=sys.argv[3]
-old=sys.stdin.read().strip()
-data={}
-if old:
-    try: data=json.loads(old)
-    except Exception: data={}
-builds=[b for b in data.get("builds",[]) if b.get("id")!=new["id"]]
-allb=[new]+builds
-keepb=allb[:keep]
-keep_parts=set()
-for b in keepb:
-    keep_parts.update(b.get("parts",[]))
-# реестр всех известных частей: старый all_parts + части всех сборок из индекса + новые
-ledger=set(data.get("all_parts",[]))
-ledger.update(new.get("parts",[]))
-for b in builds: ledger.update(b.get("parts",[]))
-evict=sorted(ledger-keep_parts)          # всё лишнее на удаление
-with open(evict_path,"w") as f:
-    for p in evict: f.write(p+"\n")
-print(json.dumps({"builds":keepb,"all_parts":sorted(keep_parts)},indent=2,ensure_ascii=False))
-PY
-<<<"$OLD_INDEX")"
-printf '%s\n' "$NEW_INDEX" > "$WORKDIR/index.json"
-
-# --- 4. Залить части текущей сборки --------------------------------------------
-put() {  # put <localfile> <remotename>
-  local f="$1" name="$2" code
-  code="$(curl -sS "${AUTH[@]}" --upload-file "$f" "$PKGBASE/$name" -o /tmp/_gv_up -w '%{http_code}')"
-  if [[ "$code" == "409" ]]; then
-    curl -fsS "${AUTH[@]}" -X DELETE "$PKGBASE/$name" -o /dev/null 2>/dev/null || true
-    code="$(curl -sS "${AUTH[@]}" --upload-file "$f" "$PKGBASE/$name" -o /tmp/_gv_up -w '%{http_code}')"
-  fi
-  [[ "$code" == "201" || "$code" == "200" ]] || { echo "Ошибка заливки $name (http=$code):" >&2; cat /tmp/_gv_up >&2; return 1; }
-  log "  залит $name (http=$code)"
+REMOTE="https://$GV_HOST/$GV_OWNER/$GV_REPO.git"      # БЕЗ токена в URL
+CLONE="$WORKDIR/repo"
+gitq() {  # git с показом stderr при сбое (а не в /dev/null)
+  git "$@" 2>"$WORKDIR/git.err" || { echo "git $* — ошибка:" >&2; cat "$WORKDIR/git.err" >&2; return 1; }
 }
+log "Клонирую репозиторий (поверхностно, только дефолтная ветка)..."
+gitq clone --depth 1 "$REMOTE" "$CLONE" >/dev/null
 
-log "Заливаю части в реестр пакетов..."
-for p in "${PARTS[@]}"; do put "$WORKDIR/$p" "$p"; done
+cd "$CLONE"
+git config user.email "ci@grype-mirror"
+git config user.name  "grype-db mirror"
 
-# --- 5. Залить index.json ------------------------------------------------------
-log "Заливаю index.json..."
-put "$WORKDIR/index.json" "index.json"
+log "Собираю orphan-ветку '$GV_BRANCH' с текущей сборкой..."
+gitq checkout --orphan "$GV_BRANCH" >/dev/null
+git rm -rf . >/dev/null 2>&1 || true                 # очистить дерево от файлов дефолтной ветки
 
-# --- 6. Чистка: удалить части вытесненных сборок (держим KEEP) ------------------
-if [[ -s "$WORKDIR/evict.txt" ]]; then
-  log "Чищу старые сборки (оставляю $KEEP)..."
-  while IFS= read -r old; do
-    [[ -n "$old" ]] || continue
-    curl -fsS "${AUTH[@]}" -X DELETE "$PKGBASE/$old" -o /dev/null 2>/dev/null \
-      && log "  удалена часть $old" || log "  не удалось удалить $old (возможно, уже нет)"
-  done < "$WORKDIR/evict.txt"
-else
-  log "Чистка: вытеснять нечего (сборок ≤ $KEEP)."
-fi
+# GitVerse ограничивает размер ОДНОГО git-push (~100 МБ, иначе HTTP 413), поэтому каждую
+# часть кладём отдельным коммитом и пушим по очереди — в пак уходит только новая часть.
+# Первый push идёт с -f (сбрасывает ветку до новой orphan-сборки, старая затирается),
+# остальные — обычным fast-forward'ом.
+first=1
+for p in "${PARTS[@]}"; do
+  cp "$PAYLOAD/$p" .
+  git add "$p"
+  git commit -q -m "grype db $BUILD_ID: $p"
+  if [[ "$first" == 1 ]]; then
+    log "Пушу '$GV_BRANCH' с force: $p (сброс ветки)..."
+    gitq push -f origin "HEAD:$GV_BRANCH" >/dev/null
+    first=0
+  else
+    log "Дозаливаю в '$GV_BRANCH': $p..."
+    gitq push origin "HEAD:$GV_BRANCH" >/dev/null
+  fi
+done
+# index.json — последним коммитом (маленький)
+cp "$PAYLOAD/index.json" .
+git add index.json
+git commit -q -m "grype db $BUILD_ID: index.json"
+log "Дозаливаю index.json..."
+gitq push origin "HEAD:$GV_BRANCH" >/dev/null
+cd /
 
-# --- 7. Самопроверка -----------------------------------------------------------
-log "Проверяю, что index.json отдаётся..."
-curl -fsS "${AUTH[@]}" -H 'Cache-Control: no-cache' "$PKGBASE/index.json?nocache=$(date +%s%N)" -o /tmp/_gv_chk \
-  && log "OK: $(tr -d '\n' </tmp/_gv_chk | cut -c1-90)..."
+# --- 4. Самопроверка: index.json отдаётся анонимно по raw ----------------------
+# (целые части не качаем — это лишние ~120 МБ на каждый прогон; их целостность
+#  всё равно проверит клиент по sha256 всего архива.)
+log "Проверяю, что index.json отдаётся по raw..."
+curl -fsS "$RAWBASE/index.json?nocache=$(date +%s%N)" -o "$WORKDIR/chk.json" \
+  && log "OK index.json: $(tr -d '\n' <"$WORKDIR/chk.json" | cut -c1-90)..."
 
-log "Готово! Зеркало GitVerse обновлено."
-echo
-echo "Части и index лежат под:"
-echo "  $PKGBASE/"
-echo "Клиент (grype-db-pull.sh) попробует GitHub, а если не выйдет — соберёт архив отсюда."
+log "Готово! База лежит в репозитории GitVerse, ветка '$GV_BRANCH':"
+echo "  $RAWBASE/"
+echo "Клиент (grype-db-pull.sh) сначала пробует GitHub, затем — эту ветку GitVerse."
