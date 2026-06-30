@@ -26,9 +26,9 @@ jobs:
 
       - name: GitVerse mirror
         env:
-          GV_TOKEN: ${{ secrets.GV_TOKEN }}     # токен GitVerse
+          GV_TOKEN: ${{ secrets.GV_TOKEN }}     # токен GitVerse (нужен git push в репозиторий)
           GV_OWNER: ${{ secrets.GV_OWNER }}     # ник GitVerse
-          GV_PKG:   ${{ secrets.GV_PKG }}       # пакет/репозиторий GitVerse
+          GV_REPO:  ${{ secrets.GV_REPO }}      # репозиторий GitVerse (база пушится в ветку db)
         run: |
           chmod +x gitverse-grype-mirror.sh
           ./gitverse-grype-mirror.sh
