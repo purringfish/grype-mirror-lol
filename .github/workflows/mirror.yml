@@ -4,7 +4,7 @@ name: mirror-grype-db
 
 on:
   schedule:
-    - cron: '0 19 * * *'     # 21=11
+    - cron: '0 23 * * *'     # 21 тут=11, 19 тут=11, 
   workflow_dispatch: {}       # кнопка "Run workflow" во вкладке Actions
 
 permissions:
