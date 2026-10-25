@@ -1,7 +1,7 @@
 {
   "status": "active",
   "schemaVersion": "v6.1.10",
-  "built": "2026-10-23T06:30:15Z",
-  "path": "https://github.com/purringfish/grype-mirror-lol/releases/download/v6.1.10/vulnerability-db_v6.1.10_2026-10-23T00.30.52Z_1792737015.tar.zst",
-  "checksum": "sha256:6e78c0f757fe96976b37b138e54e83fd75f2ad1f6c5feae2ecb008cefa8fcc0f"
+  "built": "2026-10-24T17:45:29Z",
+  "path": "https://github.com/purringfish/grype-mirror-lol/releases/download/v6.1.10/vulnerability-db_v6.1.10_2026-10-24T00.30.17Z_1792863929.tar.zst",
+  "checksum": "sha256:44f318e4a6dbba9a870bb84470ed20bf4cc24ffa41c0882dfe0ebd5a3ff771c5"
 }
